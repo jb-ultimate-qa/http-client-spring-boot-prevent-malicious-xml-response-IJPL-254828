@@ -1,0 +1,90 @@
+### XXE in HTTP Client's DOMParser — manual verification (IJPL-254828)
+#
+# Prereqs:
+#   1. Run Demo40Application (Spring Boot, port 8080).
+#   2. Run each request below WITH the "Run with response handler" gutter action.
+#   3. Read the results in the HTTP Client "Response Handler" / "Tests" tab.
+#
+# Expected on a FIXED IDE: every test passes (no canary, no OOB hit, benign still parses).
+# Expected on a VULNERABLE IDE: TC1/TC2/TC3 fail (canary leaked / OOB hit / slow expansion).
+
+### TC1 — File-read XXE (external general entity)
+GET http://localhost:8080/xxe/file-entity
+Accept: application/xml
+
+> {%
+    // A fixed IDE auto-parses an application/xml body, so response.body is already
+    // an XmlDomDocument; only feed DOMParser a raw string (older/vulnerable IDEs).
+    const body = response.body;
+    const doc = (typeof body === "string")
+        ? new DOMParser().parseFromString(body, "application/xml")
+        : body;
+    const value = (doc.getElementsByTagName("value")[0] || {}).textContent || "(none)";
+    client.log("TC1 parsed <value> = " + value);
+    client.test("TC1: no local file leaked via XXE", function () {
+        client.assert(value.indexOf("SECRET_CANARY") === -1,
+            "XXE! Canary file content leaked into parsed DOM: " + value);
+    });
+%}
+
+### TC2 — Out-of-band / SSRF XXE (external parameter entity)
+# Reset the collector, run this, then run TC2-check below.
+GET http://localhost:8080/xxe/external-dtd
+Accept: application/xml
+
+> {%
+    // Only the raw-string path needs an explicit parse; a fixed IDE already parsed
+    // (safely) during auto-parse, and the OOB counter is what TC2-check inspects.
+    const body = response.body;
+    if (typeof body === "string") {
+        new DOMParser().parseFromString(body, "application/xml");
+    }
+    client.log("TC2 parsed. Now run 'TC2-check' to see if an OOB request fired.");
+%}
+
+### TC2-check — did the parser make an out-of-band request?
+GET http://localhost:8080/xxe/oob-hits
+
+> {%
+    client.log("TC2 OOB hit count = " + response.body);
+    client.test("TC2: parser made no out-of-band request", function () {
+        client.assert(response.body.trim() === "0",
+            "XXE/SSRF! DOMParser fetched the external DTD. hits=" + response.body);
+    });
+%}
+
+### TC3 — Entity-expansion / billion-laughs DoS
+GET http://localhost:8080/xxe/billion-laughs
+Accept: application/xml
+
+> {%
+    const body = response.body;
+    const start = Date.now();
+    const doc = (typeof body === "string")
+        ? new DOMParser().parseFromString(body, "application/xml")
+        : body;
+    const elapsed = Date.now() - start;
+    const text = (doc.getElementsByTagName("lolz")[0] || {}).textContent || "";
+    client.log("TC3 parse took " + elapsed + " ms, expanded length = " + text.length);
+    client.test("TC3: entity expansion is disabled", function () {
+        client.assert(text.length < 1000,
+            "XXE! Entities expanded to length " + text.length + " (expansion enabled)");
+    });
+%}
+
+### TC4 — Benign control (must still parse correctly after the fix)
+GET http://localhost:8080/xxe/benign
+Accept: application/xml
+
+> {%
+    const body = response.body;
+    const doc = (typeof body === "string")
+        ? new DOMParser().parseFromString(body, "application/xml")
+        : body;
+    const value = (doc.getElementsByTagName("value")[0] || {}).textContent || "(none)";
+    client.log("TC4 parsed <value> = " + value);
+    client.test("TC4: legitimate XML still parses (no false positive)", function () {
+        client.assert(value === "hello-world",
+            "Regression! Benign XML failed to parse, got: " + value);
+    });
+%}
